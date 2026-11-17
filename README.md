@@ -346,6 +346,8 @@ switchbot_keypad_bridge:
 | `linked_lock` | text_sensor | no | Diagnostic text sensor whose state is the linked physical lock name, or `Unlinked` when relay mode is inactive. |
 | `keypad_battery_level` | sensor | no | Battery percentage of the linked keypad, read from its BLE advertisement (Diagnostic category). |
 | `lock_battery_level` | sensor | no | Battery percentage of the linked physical lock, read from its BLE advertisement (Diagnostic category). |
+| `lock_state` | text_sensor | no | Linked lock state (`Locked`, `Unlocked`, `Locking`, `Unlocking`, `Locking blocked`, `Unlocking blocked`, `Latch locked`, `Half locked`) from its BLE advertisement, read by a continuous passive scan (paused while the keypad or lock relay uses BLE; costs the lock no battery). |
+| `door` | binary_sensor | no | Door open/closed from the linked lock's door sensor (Lock, Lock Pro, Lock Pro WiFi, Ultra, Vision Pro), via the same passive scan. |
 | `battery_scan_interval` | time | no | How often the bridge refreshes keypad and lock battery sensors with the shared advertisement scan. Default `15min`. |
 | `rearm_after` | time | no | Delay before rearming Keypad Vision's passive face/palm unlock after the latest accepted unlock. Default `20s`; `0s` disables the timer. Does not track actual door/lock state. |
 | `reset_button` | button | no | Button that forgets the linked keypad and lock, rotates the session key and re-opens the setup wizard (no reboot). |

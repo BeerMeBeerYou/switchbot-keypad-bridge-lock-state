@@ -55,6 +55,13 @@ switchbot_keypad_bridge:
     name: "Keypad battery"
   lock_battery_level:
     name: "Lock battery"
+  # Lock state (Locked/Unlocked/...) and door open/closed, read continuously
+  # with a passive scan (costs the lock no battery).
+  # Door needs a lock with door sensor (Lock, Lock Pro, Ultra, Vision Pro).
+  lock_state:
+    name: "Lock state"
+  door:
+    name: "Door"
   # battery_scan_interval: 15min
 
   reset_button:

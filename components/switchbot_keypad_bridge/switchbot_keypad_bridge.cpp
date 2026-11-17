@@ -47,6 +47,12 @@ constexpr size_t AES_KEY_SIZE = 16;
 // Battery advert scan: one short active window per interval.
 constexpr uint32_t BATTERY_SCAN_DURATION_MS = 5000;
 constexpr uint32_t BATTERY_SCAN_RETRY_MS    = 30000;
+// Lock monitor: passive, ~9 % radio duty (ESPHome esp32_ble_tracker defaults).
+// Passive is enough: the Lock Pro family carries state, door and battery in
+// ADV_IND manufacturer data; the lock never has to answer a scan request.
+constexpr uint16_t LOCK_MONITOR_INTERVAL_MS = 320;
+constexpr uint16_t LOCK_MONITOR_WINDOW_MS   = 30;
+constexpr uint32_t LOCK_MONITOR_RESTART_MS  = 1000;
 
 bool is_shared_slot(uint8_t slot) {
   return slot == SHARED_SLOT_ORIGINAL || slot == SHARED_SLOT_VISION;
@@ -273,10 +279,11 @@ void SwitchbotKeypadBridge::loop() {
   }
 
   if (this->keypad_battery_level_sensor_ != nullptr ||
-      this->lock_battery_level_sensor_ != nullptr) {
+      this->wants_lock_advert_()) {
     this->apply_pending_keypad_battery_();
     this->apply_pending_lock_battery_();
     this->maybe_finish_battery_scan_();
+    this->maybe_run_lock_monitor_();
     this->maybe_start_battery_scan_();
   }
 }
@@ -378,6 +385,7 @@ void SwitchbotKeypadBridge::reset_pairing() {
   // Stop an in-flight battery scan window: the wizard's own blocking scans
   // share the NimBLE scan singleton and must not race it.
   this->stop_battery_scan_();
+  this->stop_lock_monitor_();
 
   // Forget the linked keypad name and its battery-scan identity.
   char empty[KEYPAD_NAME_MAX] = {};
@@ -441,9 +449,14 @@ void SwitchbotKeypadBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "  Physical lock relay: %s",
                 this->lock_linked_ ? this->linked_lock_info_.name : "Unlinked");
   if (this->keypad_battery_level_sensor_ != nullptr ||
-      this->lock_battery_level_sensor_ != nullptr) {
+      this->wants_lock_advert_()) {
     ESP_LOGCONFIG(TAG, "  Battery refresh interval: %us",
                   static_cast<unsigned>(this->battery_scan_interval_ms_ / 1000));
+  }
+  if (this->lock_state_text_sensor_ != nullptr || this->door_binary_sensor_ != nullptr) {
+    ESP_LOGCONFIG(TAG, "  Lock monitor: passive, %ums window every %ums",
+                  static_cast<unsigned>(LOCK_MONITOR_WINDOW_MS),
+                  static_cast<unsigned>(LOCK_MONITOR_INTERVAL_MS));
   }
   if (this->is_failed()) {
     ESP_LOGE(TAG, "  Initialization failed - see previous errors");
@@ -672,6 +685,7 @@ bool SwitchbotKeypadBridge::relay_to_lock_async_(const FrameHeader &header,
   // The relay opens a central connection; make sure the battery advert scan
   // isn't holding the radio.
   this->stop_battery_scan_();
+  this->stop_lock_monitor_();
 
   // Snapshot everything the task needs now: the session buffer is reused by
   // the next keypad frame, and the config must not be read off-thread.
@@ -857,7 +871,7 @@ void SwitchbotKeypadBridge::maybe_start_battery_scan_() {
 
   const bool wants_keypad =
       this->keypad_battery_level_sensor_ != nullptr && this->keypad_paired_;
-  const bool wants_lock = this->lock_battery_level_sensor_ != nullptr &&
+  const bool wants_lock = this->wants_lock_advert_() &&
                           this->lock_linked_ &&
                           this->linked_lock_info_.valid != 0;
   if (!wants_keypad && !wants_lock) {
@@ -910,11 +924,18 @@ void SwitchbotKeypadBridge::maybe_start_battery_scan_() {
 void SwitchbotKeypadBridge::handle_battery_advert_(const NimBLEAdvertisedDevice *adv) {
   // The callbacks stay registered on the shared scan singleton, so pairing
   // scans fire them too — only act inside our own scan window.
-  if (!this->battery_scan_active_.load(std::memory_order_acquire)) {
+  const bool monitor = this->lock_monitor_active_.load(std::memory_order_acquire);
+  if (!monitor && !this->battery_scan_active_.load(std::memory_order_acquire)) {
     return;
   }
 
   const std::array<uint8_t, 6> mac = addr_bytes(adv->getAddress());
+  const bool is_lock =
+      std::memcmp(mac.data(), this->battery_scan_lock_mac_, mac.size()) == 0;
+  // The monitor sees every advertiser nearby, many times a second.
+  if (monitor && !is_lock) {
+    return;
+  }
   const std::vector<uint8_t> sd = switchbot_service_data(adv);
 
   std::string mfr;
@@ -951,15 +972,18 @@ void SwitchbotKeypadBridge::handle_battery_advert_(const NimBLEAdvertisedDevice 
     }
   }
 
-  if (this->battery_scan_wants_lock_ && !this->lock_battery_scan_found_ &&
-      std::memcmp(mac.data(), this->battery_scan_lock_mac_, mac.size()) == 0) {
+  if (is_lock && (monitor || (this->battery_scan_wants_lock_ &&
+                               !this->lock_battery_scan_found_))) {
     const std::vector<uint8_t> mfr_payload = switchbot_manufacturer_payload(adv);
     const int battery = parse_lock_battery(
         this->battery_scan_lock_model_, sd.data(), sd.size(),
         mfr_payload.data(), mfr_payload.size());
-    if (battery >= 0) {
+    const LockAdvertState state = parse_lock_state(
+        this->battery_scan_lock_model_, mfr_payload.data(), mfr_payload.size());
+    if (battery >= 0 || state.status >= 0) {
       std::lock_guard<std::mutex> lk(this->rx_mutex_);
       this->lock_battery_advert_value_ = battery;
+      this->lock_state_advert_ = state;
       this->lock_battery_advert_pending_ = true;
     }
   }
@@ -1000,16 +1024,34 @@ void SwitchbotKeypadBridge::apply_pending_keypad_battery_() {
 
 void SwitchbotKeypadBridge::apply_pending_lock_battery_() {
   int value;
+  LockAdvertState state;
   {
     std::lock_guard<std::mutex> lk(this->rx_mutex_);
     if (!this->lock_battery_advert_pending_) return;
     this->lock_battery_advert_pending_ = false;
     value = this->lock_battery_advert_value_;
+    state = this->lock_state_advert_;
   }
 
   this->lock_battery_scan_found_ = true;
-  this->publish_battery_if_changed_(this->lock_battery_level_sensor_, value,
-                                    this->last_lock_battery_, "Lock");
+  if (value >= 0 && value != this->last_lock_battery_) {
+    this->publish_battery_if_changed_(this->lock_battery_level_sensor_, value,
+                                      this->last_lock_battery_, "Lock");
+  }
+  if (state.status != this->last_lock_state_.status ||
+      state.door_open != this->last_lock_state_.door_open) {
+    ESP_LOGD(TAG, "Lock state: %s, door: %d", lock_status_str(state.status),
+             state.door_open);
+  }
+  if (this->lock_state_text_sensor_ != nullptr && state.status >= 0 &&
+      state.status != this->last_lock_state_.status) {
+    this->lock_state_text_sensor_->publish_state(lock_status_str(state.status));
+  }
+  if (this->door_binary_sensor_ != nullptr && state.door_open >= 0 &&
+      state.door_open != this->last_lock_state_.door_open) {
+    this->door_binary_sensor_->publish_state(state.door_open == 1);
+  }
+  this->last_lock_state_ = state;
 }
 
 void SwitchbotKeypadBridge::maybe_finish_battery_scan_() {
@@ -1042,6 +1084,61 @@ void SwitchbotKeypadBridge::stop_battery_scan_() {
   this->battery_scan_lock_model_ = PhysicalLockModel::UNKNOWN;
 }
 
+void SwitchbotKeypadBridge::maybe_run_lock_monitor_() {
+  const uint32_t now = millis();
+  const bool wanted =
+      (this->lock_state_text_sensor_ != nullptr || this->door_binary_sensor_ != nullptr) &&
+      this->lock_linked_ && this->linked_lock_info_.valid != 0;
+  // Yield to the periodic active battery scan when it is due.
+  const bool battery_due = static_cast<int32_t>(now - this->next_battery_scan_at_) >= 0;
+  NimBLEScan *scan = NimBLEDevice::getScan();
+
+  if (this->lock_monitor_active_.load(std::memory_order_acquire)) {
+    if (!wanted || battery_due || this->background_ble_busy_() || !scan->isScanning()) {
+      this->stop_lock_monitor_();
+      this->lock_monitor_retry_at_ = now + LOCK_MONITOR_RESTART_MS;
+    }
+    return;
+  }
+
+  if (!wanted || battery_due || this->battery_scan_active_.load(std::memory_order_acquire) ||
+      this->background_ble_busy_() || scan->isScanning() ||
+      static_cast<int32_t>(now - this->lock_monitor_retry_at_) < 0) {
+    return;
+  }
+
+  std::memcpy(this->battery_scan_lock_mac_, this->linked_lock_info_.mac,
+              sizeof(this->battery_scan_lock_mac_));
+  this->battery_scan_lock_model_ =
+      static_cast<PhysicalLockModel>(this->linked_lock_info_.model);
+  scan->setScanCallbacks(this->battery_scan_callbacks_, true);  // want duplicates
+  scan->setActiveScan(false);
+  scan->setInterval(LOCK_MONITOR_INTERVAL_MS);
+  scan->setWindow(LOCK_MONITOR_WINDOW_MS);
+  scan->setMaxResults(0);  // callback only, keep nothing: the scan runs forever
+  this->lock_monitor_active_.store(true, std::memory_order_release);
+  if (scan->start(0, false, true)) {
+    ESP_LOGD(TAG, "Lock monitor scan started");
+  } else {
+    ESP_LOGW(TAG, "Lock monitor scan failed to start");
+    this->stop_lock_monitor_();
+    this->lock_monitor_retry_at_ = now + BATTERY_SCAN_RETRY_MS;
+  }
+}
+
+void SwitchbotKeypadBridge::stop_lock_monitor_() {
+  if (!this->lock_monitor_active_.exchange(false, std::memory_order_acq_rel)) {
+    return;
+  }
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) {
+    scan->stop();
+  }
+  // Restore the singleton defaults the wizard's getResults() scans rely on.
+  scan->setMaxResults(0xFF);
+  scan->setDuplicateFilter(1);
+}
+
 bool SwitchbotKeypadBridge::background_ble_busy_() const {
   return this->pairing_ui_.is_running() ||
          this->lock_relay_busy_.load(std::memory_order_relaxed) ||
@@ -1051,6 +1148,11 @@ bool SwitchbotKeypadBridge::background_ble_busy_() const {
 void SwitchbotKeypadBridge::clear_lock_battery_() {
   this->reset_battery_sensor_(this->lock_battery_level_sensor_,
                               this->last_lock_battery_);
+  this->last_lock_state_ = LockAdvertState{};
+  this->publish_text_or_unlinked_(this->lock_state_text_sensor_, nullptr);
+  if (this->door_binary_sensor_ != nullptr) {
+    this->door_binary_sensor_->invalidate_state();
+  }
 }
 
 }  // namespace switchbot_keypad_bridge

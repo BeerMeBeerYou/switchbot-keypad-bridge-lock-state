@@ -10,6 +10,7 @@
 #include <mutex>
 #include <vector>
 
+#include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/button/button.h"
 #include "esphome/components/event/event.h"
 #include "esphome/components/sensor/sensor.h"
@@ -64,6 +65,8 @@ class SwitchbotKeypadBridge : public Component {
   SUB_TEXT_SENSOR(linked_lock)
   SUB_SENSOR(keypad_battery_level)
   SUB_SENSOR(lock_battery_level)
+  SUB_TEXT_SENSOR(lock_state)
+  SUB_BINARY_SENSOR(door)
 
  public:
   void setup() override;
@@ -180,6 +183,9 @@ class SwitchbotKeypadBridge : public Component {
   void maybe_start_battery_scan_();
   void maybe_finish_battery_scan_();
   void stop_battery_scan_();
+  // Continuous passive scan for lock state / door between battery scans.
+  void maybe_run_lock_monitor_();
+  void stop_lock_monitor_();
   void apply_pending_keypad_battery_();
   void apply_pending_lock_battery_();
   // Runs on the NimBLE host task — parses the advert and queues the result.
@@ -187,7 +193,12 @@ class SwitchbotKeypadBridge : public Component {
 
   // ----- Battery helpers -----------------------------------------------------
 
-  void clear_lock_battery_();
+  void clear_lock_battery_();  // also clears lock state / door
+  bool wants_lock_advert_() const {
+    return this->lock_battery_level_sensor_ != nullptr ||
+           this->lock_state_text_sensor_ != nullptr ||
+           this->door_binary_sensor_ != nullptr;
+  }
   bool background_ble_busy_() const;
   void save_and_sync_(ESPPreferenceObject &pref, const KeypadInfo *value);
   void save_and_sync_(ESPPreferenceObject &pref, const LinkedLockInfo *value);
@@ -288,6 +299,8 @@ class SwitchbotKeypadBridge : public Component {
   // Written by loop(), read by the NimBLE scan callback as its "is this our
   // scan window?" gate — hence atomic.
   std::atomic<bool> battery_scan_active_{false};
+  std::atomic<bool> lock_monitor_active_{false};
+  uint32_t lock_monitor_retry_at_{0};
   BatteryScanCallbacks *battery_scan_callbacks_{nullptr};
   std::atomic<bool> battery_scan_wants_keypad_{false};
   std::atomic<bool> battery_scan_wants_lock_{false};
@@ -309,6 +322,8 @@ class SwitchbotKeypadBridge : public Component {
   uint8_t keypad_battery_advert_family_{0};
   bool lock_battery_advert_pending_{false};
   int lock_battery_advert_value_{-1};
+  LockAdvertState lock_state_advert_{};
+  LockAdvertState last_lock_state_{};
 };
 
 // Home Assistant reset button: forgets keypad and lock, rotates the shared key

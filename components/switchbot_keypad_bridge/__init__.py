@@ -24,7 +24,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 import esphome.final_validate as fv
 from esphome import automation
-from esphome.components import button, event, sensor, text_sensor
+from esphome.components import binary_sensor, button, event, sensor, text_sensor
 from esphome.components.esp32 import (
     add_idf_component,
     add_idf_sdkconfig_option,
@@ -34,6 +34,7 @@ from esphome.const import (
     CONF_ID,
     CONF_TRIGGER_ID,
     DEVICE_CLASS_BATTERY,
+    DEVICE_CLASS_DOOR,
     ENTITY_CATEGORY_CONFIG,
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
@@ -45,7 +46,7 @@ LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@pierluigizagaria"]
 DEPENDENCIES = ["esp32"]
-AUTO_LOAD = ["event", "text_sensor", "button", "sensor"]
+AUTO_LOAD = ["event", "text_sensor", "button", "sensor", "binary_sensor"]
 MULTI_CONF = False
 
 CONF_KEYPAD_ACTION = "keypad_action"
@@ -53,6 +54,8 @@ CONF_KEYPAD = "keypad"
 CONF_LINKED_LOCK = "linked_lock"
 CONF_KEYPAD_BATTERY_LEVEL = "keypad_battery_level"
 CONF_LOCK_BATTERY_LEVEL = "lock_battery_level"
+CONF_LOCK_STATE = "lock_state"
+CONF_DOOR = "door"
 CONF_BATTERY_SCAN_INTERVAL = "battery_scan_interval"
 CONF_REARM_AFTER = "rearm_after"
 CONF_RESET_BUTTON = "reset_button"
@@ -130,6 +133,14 @@ CONFIG_SCHEMA = cv.Schema(
             state_class=STATE_CLASS_MEASUREMENT,
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             accuracy_decimals=0,
+        ),
+        # Lock state and door sensor come from a continuous passive scan of the
+        # linked lock's advert (paused while the keypad or relay uses BLE).
+        cv.Optional(CONF_LOCK_STATE): text_sensor.text_sensor_schema(
+            icon="mdi:lock",
+        ),
+        cv.Optional(CONF_DOOR): binary_sensor.binary_sensor_schema(
+            device_class=DEVICE_CLASS_DOOR,
         ),
         cv.Optional(
             CONF_BATTERY_SCAN_INTERVAL, default="15min"
@@ -245,7 +256,23 @@ async def to_code(config):
         batt = await sensor.new_sensor(lock_battery_conf)
         cg.add(var.set_lock_battery_level_sensor(batt))
 
-    if config.get(CONF_KEYPAD_BATTERY_LEVEL) or config.get(CONF_LOCK_BATTERY_LEVEL):
+    if lock_state_conf := config.get(CONF_LOCK_STATE):
+        sens = await text_sensor.new_text_sensor(lock_state_conf)
+        cg.add(var.set_lock_state_text_sensor(sens))
+
+    if door_conf := config.get(CONF_DOOR):
+        sens = await binary_sensor.new_binary_sensor(door_conf)
+        cg.add(var.set_door_binary_sensor(sens))
+
+    if any(
+        config.get(k)
+        for k in (
+            CONF_KEYPAD_BATTERY_LEVEL,
+            CONF_LOCK_BATTERY_LEVEL,
+            CONF_LOCK_STATE,
+            CONF_DOOR,
+        )
+    ):
         cg.add(
             var.set_battery_scan_interval(
                 config[CONF_BATTERY_SCAN_INTERVAL].total_milliseconds
