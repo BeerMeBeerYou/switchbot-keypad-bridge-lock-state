@@ -27,6 +27,10 @@ logger:
   level: VERBOSE
 
 api:
+  # Required once the bridge can open the door: only clients holding this key
+  # may talk to the device.
+  encryption:
+    key: !secret api_encryption_key
 
 ota:
   - platform: esphome
@@ -61,6 +65,9 @@ switchbot_keypad_bridge:
   # Lock state (Locked/Unlocked/...) and door open/closed, read continuously
   # with a passive scan (costs the lock no battery).
   # Door needs a lock with door sensor (Lock, Lock Pro, Ultra, Vision Pro).
+  # Lock/unlock the linked lock from Home Assistant.
+  lock:
+    name: "Lock control"
   lock_state:
     name: "Lock state"
   door:

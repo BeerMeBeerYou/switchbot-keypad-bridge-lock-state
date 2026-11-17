@@ -24,7 +24,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 import esphome.final_validate as fv
 from esphome import automation
-from esphome.components import binary_sensor, button, event, sensor, text_sensor
+from esphome.components import binary_sensor, button, event, lock, sensor, text_sensor
 from esphome.components.esp32 import (
     add_idf_component,
     add_idf_sdkconfig_option,
@@ -46,7 +46,7 @@ LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@pierluigizagaria"]
 DEPENDENCIES = ["esp32"]
-AUTO_LOAD = ["event", "text_sensor", "button", "sensor", "binary_sensor"]
+AUTO_LOAD = ["event", "text_sensor", "button", "sensor", "binary_sensor", "lock"]
 MULTI_CONF = False
 
 CONF_KEYPAD_ACTION = "keypad_action"
@@ -56,6 +56,7 @@ CONF_KEYPAD_BATTERY_LEVEL = "keypad_battery_level"
 CONF_LOCK_BATTERY_LEVEL = "lock_battery_level"
 CONF_LOCK_STATE = "lock_state"
 CONF_DOOR = "door"
+CONF_LOCK = "lock"
 CONF_BATTERY_SCAN_INTERVAL = "battery_scan_interval"
 CONF_REARM_AFTER = "rearm_after"
 CONF_RESET_BUTTON = "reset_button"
@@ -77,6 +78,7 @@ SwitchbotKeypadBridge = switchbot_keypad_bridge_ns.class_(
     "SwitchbotKeypadBridge", cg.Component
 )
 ResetButton = switchbot_keypad_bridge_ns.class_("ResetButton", button.Button)
+LinkedLock = switchbot_keypad_bridge_ns.class_("LinkedLock", lock.Lock)
 RearmAction = switchbot_keypad_bridge_ns.class_("RearmAction", automation.Action)
 LockTrigger = switchbot_keypad_bridge_ns.class_(
     "LockTrigger", automation.Trigger.template()
@@ -142,6 +144,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_DOOR): binary_sensor.binary_sensor_schema(
             device_class=DEVICE_CLASS_DOOR,
         ),
+        # Lock/unlock the linked physical lock from Home Assistant.
+        cv.Optional(CONF_LOCK): lock.lock_schema(LinkedLock),
         cv.Optional(
             CONF_BATTERY_SCAN_INTERVAL, default="15min"
         ): cv.positive_time_period_milliseconds,
@@ -264,6 +268,11 @@ async def to_code(config):
         sens = await binary_sensor.new_binary_sensor(door_conf)
         cg.add(var.set_door_binary_sensor(sens))
 
+    if lock_conf := config.get(CONF_LOCK):
+        lk = await lock.new_lock(lock_conf)
+        await cg.register_parented(lk, config[CONF_ID])
+        cg.add(var.set_lock_entity(lk))
+
     if any(
         config.get(k)
         for k in (
@@ -271,6 +280,7 @@ async def to_code(config):
             CONF_LOCK_BATTERY_LEVEL,
             CONF_LOCK_STATE,
             CONF_DOOR,
+            CONF_LOCK,
         )
     ):
         cg.add(

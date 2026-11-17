@@ -353,6 +353,7 @@ void SwitchbotKeypadBridge::apply_pending_lock_relay_() {
   if (this->pending_relay_apply_.exchange(false, std::memory_order_acquire)) {
     if (!this->relay_ok_) {
       ESP_LOGW(TAG, "Physical lock relay finished without a lock reply");
+      this->publish_lock_entity_(this->last_lock_state_.status);
       return;
     }
     switch (this->relay_command_.type) {
@@ -453,7 +454,7 @@ void SwitchbotKeypadBridge::dump_config() {
     ESP_LOGCONFIG(TAG, "  Battery refresh interval: %us",
                   static_cast<unsigned>(this->battery_scan_interval_ms_ / 1000));
   }
-  if (this->lock_state_text_sensor_ != nullptr || this->door_binary_sensor_ != nullptr) {
+  if (this->wants_lock_monitor_()) {
     ESP_LOGCONFIG(TAG, "  Lock monitor: passive, %ums window every %ums",
                   static_cast<unsigned>(LOCK_MONITOR_WINDOW_MS),
                   static_cast<unsigned>(LOCK_MONITOR_INTERVAL_MS));
@@ -678,8 +679,43 @@ bool SwitchbotKeypadBridge::relay_to_lock_async_(const FrameHeader &header,
     ESP_LOGW(TAG, "Cannot relay command: no decrypted keypad plaintext");
     return false;
   }
+  return this->start_relay_task_(
+      this->physical_lock_config_(header.key_id),
+      {this->session_.plaintext(),
+       this->session_.plaintext() + this->session_.plaintext_size()},
+      command);
+}
+
+bool SwitchbotKeypadBridge::command_physical_lock(bool lock) {
+  if (!this->lock_linked_ || this->linked_lock_info_.valid == 0) {
+    ESP_LOGW(TAG, "No physical lock linked");
+    return false;
+  }
+  // Same frames the keypad sends on the shared slot (see lock_protocol.cpp).
+  // shortcut: unlock goes out as a keypad PIN unlock (index 0), so the
+  // SwitchBot app history lists it as a keypad unlock; fine unless that log matters.
+  DecodedCommand command;
+  std::vector<uint8_t> plaintext;
+  if (lock) {
+    command.type = CommandType::LOCK;
+    plaintext = {0x0F, 0x4E, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00};
+  } else {
+    command.type = CommandType::UNLOCK;
+    command.method = UnlockMethod::PIN;
+    command.credential_index = 0;
+    plaintext = {0x0F, 0x4E, 0x01, 0x03, 0x04, 0x80, 0x00, 0x00};
+  }
+  ESP_LOGI(TAG, "Home Assistant: %s physical lock", lock ? "Lock" : "Unlock");
+  return this->start_relay_task_(
+      this->physical_lock_config_(this->linked_lock_info_.slot_id),
+      std::move(plaintext), command);
+}
+
+bool SwitchbotKeypadBridge::start_relay_task_(PhysicalLockClient::Config cfg,
+                                              std::vector<uint8_t> plaintext,
+                                              const DecodedCommand &command) {
   if (this->lock_relay_busy_.exchange(true)) {
-    ESP_LOGW(TAG, "Lock relay still in flight — answering this command locally");
+    ESP_LOGW(TAG, "Lock relay still in flight — command not sent to the lock");
     return false;
   }
   // The relay opens a central connection; make sure the battery advert scan
@@ -695,11 +731,7 @@ bool SwitchbotKeypadBridge::relay_to_lock_async_(const FrameHeader &header,
     std::vector<uint8_t> plaintext;
     DecodedCommand command;
   };
-  auto *ctx = new RelayCtx{
-      this, this->physical_lock_config_(header.key_id),
-      {this->session_.plaintext(),
-       this->session_.plaintext() + this->session_.plaintext_size()},
-      command};
+  auto *ctx = new RelayCtx{this, std::move(cfg), std::move(plaintext), command};
 
   BaseType_t rc = xTaskCreatePinnedToCore(
       [](void *raw) {
@@ -1051,6 +1083,9 @@ void SwitchbotKeypadBridge::apply_pending_lock_battery_() {
       state.door_open != this->last_lock_state_.door_open) {
     this->door_binary_sensor_->publish_state(state.door_open == 1);
   }
+  if (state.status >= 0) {
+    this->publish_lock_entity_(state.status);
+  }
   this->last_lock_state_ = state;
 }
 
@@ -1086,9 +1121,8 @@ void SwitchbotKeypadBridge::stop_battery_scan_() {
 
 void SwitchbotKeypadBridge::maybe_run_lock_monitor_() {
   const uint32_t now = millis();
-  const bool wanted =
-      (this->lock_state_text_sensor_ != nullptr || this->door_binary_sensor_ != nullptr) &&
-      this->lock_linked_ && this->linked_lock_info_.valid != 0;
+  const bool wanted = this->wants_lock_monitor_() && this->lock_linked_ &&
+                      this->linked_lock_info_.valid != 0;
   // Yield to the periodic active battery scan when it is due.
   const bool battery_due = static_cast<int32_t>(now - this->next_battery_scan_at_) >= 0;
   NimBLEScan *scan = NimBLEDevice::getScan();
@@ -1152,6 +1186,43 @@ void SwitchbotKeypadBridge::clear_lock_battery_() {
   this->publish_text_or_unlinked_(this->lock_state_text_sensor_, nullptr);
   if (this->door_binary_sensor_ != nullptr) {
     this->door_binary_sensor_->invalidate_state();
+  }
+  this->publish_lock_entity_(-1);
+}
+
+void SwitchbotKeypadBridge::publish_lock_entity_(int status) {
+  if (this->lock_entity_ == nullptr) {
+    return;
+  }
+  lock::LockState s;
+  switch (status) {
+    case 0: s = lock::LOCK_STATE_LOCKED; break;
+    case 2: s = lock::LOCK_STATE_LOCKING; break;
+    case 3: s = lock::LOCK_STATE_UNLOCKING; break;
+    case 4:  // locking blocked
+    case 5:  // unlocking blocked
+      s = lock::LOCK_STATE_JAMMED; break;
+    case 1:
+    case 6:  // latch locked / not fully locked: not safe to call it locked
+    case 7:  // half locked
+      s = lock::LOCK_STATE_UNLOCKED; break;
+    default: s = lock::LOCK_STATE_NONE; break;
+  }
+  this->lock_entity_->publish_state(s);
+}
+
+void LinkedLock::control(const lock::LockCall &call) {
+  if (!call.get_state().has_value()) {
+    return;
+  }
+  const lock::LockState target = *call.get_state();
+  if (target != lock::LOCK_STATE_LOCKED && target != lock::LOCK_STATE_UNLOCKED) {
+    return;
+  }
+  const bool want_lock = target == lock::LOCK_STATE_LOCKED;
+  if (this->parent_->command_physical_lock(want_lock)) {
+    // The lock monitor replaces this with the real state once the lock moved.
+    this->publish_state(want_lock ? lock::LOCK_STATE_LOCKING : lock::LOCK_STATE_UNLOCKING);
   }
 }
 

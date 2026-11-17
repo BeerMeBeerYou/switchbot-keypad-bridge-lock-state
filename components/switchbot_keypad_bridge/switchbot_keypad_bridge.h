@@ -13,6 +13,7 @@
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/button/button.h"
 #include "esphome/components/event/event.h"
+#include "esphome/components/lock/lock.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/automation.h"
@@ -80,6 +81,10 @@ class SwitchbotKeypadBridge : public Component {
   }
   void set_battery_scan_interval(uint32_t ms) { this->battery_scan_interval_ms_ = ms; }
   void set_rearm_after(uint32_t ms) { this->keypad_state_.set_rearm_after(ms); }
+  void set_lock_entity(lock::Lock *entity) { this->lock_entity_ = entity; }
+
+  // Lock or unlock the linked physical lock (Home Assistant lock entity).
+  bool command_physical_lock(bool lock);
 
   // Report LOCKED on the next keypad poll, without operating a physical lock
   // or publishing a Lock event. Safe to call from local ESPHome automations.
@@ -160,6 +165,8 @@ class SwitchbotKeypadBridge : public Component {
   // one-shot background task. The keypad is never answered from this path;
   // relay completion is logged only.
   bool relay_to_lock_async_(const FrameHeader &header, const DecodedCommand &command);
+  bool start_relay_task_(PhysicalLockClient::Config cfg, std::vector<uint8_t> plaintext,
+                         const DecodedCommand &command);
   PhysicalLockClient::Config physical_lock_config_(uint8_t slot_id) const;
 
   // ----- Transport helpers ---------------------------------------------------
@@ -195,10 +202,13 @@ class SwitchbotKeypadBridge : public Component {
 
   void clear_lock_battery_();  // also clears lock state / door
   bool wants_lock_advert_() const {
-    return this->lock_battery_level_sensor_ != nullptr ||
-           this->lock_state_text_sensor_ != nullptr ||
-           this->door_binary_sensor_ != nullptr;
+    return this->lock_battery_level_sensor_ != nullptr || this->wants_lock_monitor_();
   }
+  bool wants_lock_monitor_() const {
+    return this->lock_state_text_sensor_ != nullptr ||
+           this->door_binary_sensor_ != nullptr || this->lock_entity_ != nullptr;
+  }
+  void publish_lock_entity_(int status);
   bool background_ble_busy_() const;
   void save_and_sync_(ESPPreferenceObject &pref, const KeypadInfo *value);
   void save_and_sync_(ESPPreferenceObject &pref, const LinkedLockInfo *value);
@@ -324,6 +334,7 @@ class SwitchbotKeypadBridge : public Component {
   int lock_battery_advert_value_{-1};
   LockAdvertState lock_state_advert_{};
   LockAdvertState last_lock_state_{};
+  lock::Lock *lock_entity_{nullptr};
 };
 
 // Home Assistant reset button: forgets keypad and lock, rotates the shared key
@@ -331,6 +342,20 @@ class SwitchbotKeypadBridge : public Component {
 class ResetButton : public button::Button, public Parented<SwitchbotKeypadBridge> {
  protected:
   void press_action() override;
+};
+
+// Home Assistant lock entity for the linked physical lock. Commands go out
+// over the keypad's shared slot; state comes from the lock monitor scan.
+class LinkedLock : public lock::Lock, public Parented<SwitchbotKeypadBridge> {
+ public:
+  LinkedLock() {
+    this->traits.set_supported_states(
+        {lock::LOCK_STATE_NONE, lock::LOCK_STATE_LOCKED, lock::LOCK_STATE_UNLOCKED,
+         lock::LOCK_STATE_JAMMED, lock::LOCK_STATE_LOCKING, lock::LOCK_STATE_UNLOCKING});
+  }
+
+ protected:
+  void control(const lock::LockCall &call) override;
 };
 
 }  // namespace switchbot_keypad_bridge
