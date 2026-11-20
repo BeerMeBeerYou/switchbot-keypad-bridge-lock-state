@@ -12,6 +12,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "ble_utils.h"
+#include "hex_utils.h"
 #include "keypad_advert.h"
 #include "mac_utils.h"
 

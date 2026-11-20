@@ -7,6 +7,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "aes_ctr.h"
+#include "hex_utils.h"
 
 namespace esphome {
 namespace switchbot_keypad_bridge {

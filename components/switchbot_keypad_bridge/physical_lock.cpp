@@ -10,6 +10,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "aes_ctr.h"
+#include "hex_utils.h"
 #include "ble_utils.h"
 #include "mac_utils.h"
 
